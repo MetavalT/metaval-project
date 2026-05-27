@@ -1,12 +1,12 @@
 const pool = require("../config/db");
-const path = require("path");
 const { exportToExcel } = require("../services/excelService");
-const fs = require("fs");
-const pdfParse = require("pdf-parse");
-const Tesseract = require("tesseract.js");
-const pdf = require("pdf-poppler");
 
-// STRICT WHITELIST: Only these exact table names are allowed to exist or be accessed
+// IMPORTING Standalone Modular Core Services
+const { extractTextFromPDF } = require("../services/pdfService");
+const { mapTextToColumnsStrategy } = require("../services/strategyMatcher");
+const { buildWorkbookSearchQuery } = require("../services/queryFilterService");
+
+// Whitelist validation boundaries
 const STRICT_TABLE_WHITELIST = [
   'bore_type', 'density_unit', 'dp_unit', 'flange_material', 'flange_schedule',
   'flange_type', 'flow_rate_unit', 'gasket', 'jackbolt', 'master_data',
@@ -15,40 +15,33 @@ const STRICT_TABLE_WHITELIST = [
 ];
 
 // ==========================================================
-// 1. DYNAMIC DATABASE SHEET VIEWER (REAL POSTGRES COLUMNS)
+// 1. DYNAMIC GRID INQUIRY SYSTEM
 // ==========================================================
 const getWorkbookTableData = async (req, res) => {
   try {
     const { tableName } = req.params;
-
-    // Safety guard wall checking your verified table names
     if (!STRICT_TABLE_WHITELIST.includes(tableName)) {
-      return res.status(400).json({ success: false, message: "Access Denied: Invalid table parameter." });
+      return res.status(400).json({ success: false, message: "Access Denied: Invalid table selection." });
     }
 
-    // A. Discover the true, real columns defined inside this specific Postgres table right now
     const columnDiscovery = await pool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`,
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`,
       [tableName]
     );
     const columns = columnDiscovery.rows.map(c => c.column_name);
 
-    // B. Fetch the real underlying data records
-    const dataRows = await pool.query(`SELECT * FROM ${tableName} ORDER BY id DESC LIMIT 50`);
+    const { baseQueryString, sqlArguments } = buildWorkbookSearchQuery(tableName, req.query, columns);
+    const finalizedQuery = baseQueryString + ` ORDER BY id DESC LIMIT 50`;
+    const filteredRows = await pool.query(finalizedQuery, sqlArguments);
 
-    res.json({
-      success: true,
-      tableName,
-      columns, // Sent directly to React to build the dynamic headers dynamically
-      rows: dataRows.rows
-    });
+    res.json({ success: true, tableName, columns, rows: filteredRows.rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 };
 
 // ==========================================================
-// 2. EXTRACTION ROUTER ENGINE (DYNAMIC VALUE MAPPER)
+// 2. INDUSTRIAL DOCUMENT EXTRACTION PIPELINE
 // ==========================================================
 const uploadPDF = async (req, res) => {
   try {
@@ -56,61 +49,29 @@ const uploadPDF = async (req, res) => {
     const targetTable = req.body.target_table || 'ofa_upload';
 
     if (!STRICT_TABLE_WHITELIST.includes(targetTable) || targetTable === 'records') {
-      return res.status(400).json({ success: false, error: "Invalid production target selection." });
+      return res.status(400).json({ success: false, error: "Invalid target spreadsheet selection." });
     }
+    if (!file) return res.status(400).json({ success: false, message: "No document attached." });
 
-    if (!file) {
-      return res.status(400).json({ success: false, message: "No file uploaded" });
-    }
+    // A. Parse document raw text
+    const extractedText = await extractTextFromPDF(file.path);
 
-    // Dual-Path Character Read vs OCR Check
-    let extractedText = "";
-    const dataBuffer = fs.readFileSync(file.path);
-    const pdfData = await pdfParse(dataBuffer);
-    extractedText = pdfData.text.trim();
-
-    if (!extractedText || extractedText.length < 20) {
-      const opts = { format: "png", out_dir: "./uploads", out_prefix: "page", page: 1 };
-      await pdf.convert(file.path, opts);
-      const result = await Tesseract.recognize("./uploads/page-1.png", "eng");
-      extractedText = result.data.text;
-    }
-
-    // Read real column names straight from your Postgres system schema catalogs
+    // B. Query database metadata details directly
     const columnDiscovery = await pool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`,
       [targetTable]
     );
+
+    // C. Evaluate matching profiles using our newly verified strategy matcher
+    const queryValues = mapTextToColumnsStrategy(columnDiscovery.rows, extractedText, file);
     const tableColumns = columnDiscovery.rows.map(r => r.column_name);
 
-    let insertFields = [];
-    let queryValues = [];
-    let placeholderIdx = 1;
-
-    tableColumns.forEach(column => {
-      if (column === 'id' || column === 'created_at') return;
-
-      insertFields.push(column);
-      
-      // Match document properties to your defined database column formats
-      if (column === 'filename' || column === 'name') {
-        queryValues.push(file.originalname);
-      } else if (column === 'source_type') {
-        queryValues.push('PDF');
-      } else if (column === 'email') {
-        const foundEmail = extractedText.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/gi);
-        queryValues.push(foundEmail ? foundEmail[0] : 'supplier_mail@company.com');
-      } else if (column === 'age' || column === 'quantity') {
-        const foundNum = extractedText.match(/\b(1[8-9]|[2-9][0-9])\b/g);
-        queryValues.push(foundNum ? parseInt(foundNum[0], 10) : 0);
-      } else {
-        // Safe data fallback mapping into your textual fields layout
-        queryValues.push(extractedText.substring(0, 40).trim() || "Parsed Parameter Value");
-      }
-    });
-
-    const fieldsStr = insertFields.join(", ");
-    const valuesStr = insertFields.map(() => `$${placeholderIdx++}`).join(", ");
+    // D. Isolate structural sequences for custom database parameters mapping
+    const insertFields = tableColumns.filter(col => col !== 'id' && col !== 'created_at');
+    
+    // ✅ ESCAPING WRAPPER: Ensures spacing inputs like "Item Name" never confuse the parser!
+    const fieldsStr = insertFields.map(col => `"${col}"`).join(", ");
+    const valuesStr = insertFields.map((_, index) => `$${index + 1}`).join(", ");
 
     const dbInsertResult = await pool.query(
       `INSERT INTO ${targetTable} (${fieldsStr}) VALUES (${valuesStr}) RETURNING *`,
@@ -119,51 +80,71 @@ const uploadPDF = async (req, res) => {
 
     res.json({
       success: true,
-      message: `Data successfully parsed and added into table alignment: '${targetTable}'`,
+      message: `Document processed and logged inside table: ${targetTable}`,
       insertedData: dbInsertResult.rows[0]
     });
+  } catch (err) {
+    res.status(500).json({ success: false, error: "Modular Pipeline Intercept Error: " + err.message });
+  }
+};
+
+// ==========================================================
+// 3. EXCEL BACKEND EXPORT ENGINE
+// ==========================================================
+const exportExcel = async (req, res) => {
+  try {
+    const targetTable = req.query.table || 'records';
+    if (!STRICT_TABLE_WHITELIST.includes(targetTable)) return res.sendStatus(400);
+
+    const columnDiscovery = await pool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,
+      [targetTable]
+    );
+    const columns = columnDiscovery.rows.map(c => c.column_name);
+
+    let { baseQueryString, sqlArguments } = buildWorkbookSearchQuery(targetTable, req.query, columns);
+    baseQueryString += ` ORDER BY id DESC`;
+
+    const result = await pool.query(baseQueryString, sqlArguments);
+    const filePath = exportToExcel(result.rows);
+    res.download(filePath);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 };
 
 // ==========================================================
-// 3. RESTORED ORIGINAL METRICS & KPI COUNT DATA
+// 4. METRICS AGGREGATION & TELEMETRY SYSTEMS
 // ==========================================================
 const getDashboardData = async (req, res) => {
   try {
-    // A. TOTAL RECORDS: Reads everything matching total connection actions from records
-    const totalResult = await pool.query("SELECT COUNT(*) FROM records");
-    const totalRecords = totalResult.rows[0].count;
-
-    // B. DAILY UPDATES: Changes recorded during the current shift timeline
-    const todayResult = await pool.query("SELECT COUNT(*) FROM records WHERE DATE(created_at) = CURRENT_DATE");
-    const todayRecords = todayResult.rows[0].count;
-
-    // C. PDF COUNT: Document specific arrivals tracking indicator logs
-    const pdfResult = await pool.query("SELECT COUNT(*) FROM records WHERE source_type = 'PDF'");
-    const pdfCount = pdfResult.rows[0].count;
-
-    // D. TEXT COUNT: Text additions index counter parameters
-    const textResult = await pool.query("SELECT COUNT(*) FROM records WHERE source_type = 'TEXT'");
-    const textCount = textResult.rows[0].count;
-
-    // Pull the clean sandbox log data history array 
-    const recentRecords = await pool.query("SELECT * FROM records ORDER BY id DESC LIMIT 10");
+    const ofaCountResult = await pool.query("SELECT COUNT(*) FROM ofa_upload");
+    const masterCountResult = await pool.query("SELECT COUNT(*) FROM master_data");
+    const totalRecordsResult = await pool.query("SELECT COUNT(*) FROM records");
+    
+    const dailyUpdatesResult = await pool.query(
+      `
+      SELECT (SELECT COUNT(*) FROM ofa_upload WHERE DATE(created_at) = CURRENT_DATE) +
+             (SELECT COUNT(*) FROM master_data WHERE DATE(created_at) = CURRENT_DATE) +
+             (SELECT COUNT(*) FROM records WHERE DATE(created_at) = CURRENT_DATE) as daily_total
+      `
+    );
 
     const stats = [
-      { title: "Total PDF Uploaded", value: pdfCount, color: "bg-blue-100 text-blue-700" },
-      { title: "Text Records", value: textCount, color: "bg-green-100 text-green-700" },
-      { title: "Total Records", value: totalRecords, color: "bg-purple-100 text-purple-700" },
-      { title: "Daily Updates", value: todayRecords, color: "bg-yellow-100 text-yellow-700" },
+      { title: "Ofa Upload Records", value: ofaCountResult.rows[0].count, color: "bg-blue-100 text-blue-700" },
+      { title: "Master Data Specs", value: masterCountResult.rows[0].count, color: "bg-green-100 text-green-700" },
+      { title: "Connection Sandbox Logs", value: totalRecordsResult.rows[0].count, color: "bg-purple-100 text-purple-700" },
+      { title: "Daily System Actions", value: dailyUpdatesResult.rows[0].daily_total || 0, color: "bg-yellow-100 text-yellow-700" },
     ];
+
+    const currentQueriesFeed = await pool.query("SELECT * FROM queries WHERE is_resolved = FALSE ORDER BY id DESC LIMIT 10");
 
     res.json({
       success: true,
       stats,
-      docsDone: parseInt(pdfCount, 10),
-      docsRecv: parseInt(totalRecords, 10),
-      records: recentRecords.rows,
+      docsDone: parseInt(ofaCountResult.rows[0].count, 10),
+      docsRecv: parseInt(ofaCountResult.rows[0].count, 10) + parseInt(masterCountResult.rows[0].count, 10),
+      records: currentQueriesFeed.rows 
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -171,8 +152,35 @@ const getDashboardData = async (req, res) => {
 };
 
 // ==========================================================
-// 4. ISOLATED DATABASE CONNECTION TESTING (SANDBOX PING)
+// 5. QUERY SYSTEM GATEWAYS WITH SERVER CLOCK RECORDING
 // ==========================================================
+const submitQuery = async (req, res) => {
+  try {
+    // Fallbacks guarantee that fields are never passed as 'undefined' variables
+    const sender_name = req.body.sender_name || "Office User";
+    const sender_email = req.body.sender_email || "no-reply@office.com";
+    const receiver_email = req.body.receiver_email || "admin@office.com";
+    const message = req.body.message || "";
+
+    if (!message) {
+      return res.status(400).json({ success: false, error: "Message content cannot be blank." });
+    }
+
+    // Explicitly matching table inputs
+    const result = await pool.query(
+      `INSERT INTO queries (sender_name, sender_email, receiver_email, message, is_resolved) 
+       VALUES ($1, $2, $3, $4, FALSE) 
+       RETURNING *, created_at as automatic_timestamp`,
+      [sender_name, sender_email, receiver_email, message]
+    );
+    
+    res.json({ success: true, message: "Query routed safely.", data: result.rows[0] });
+  } catch (err) {
+    // This transmits the exact error to your console so you can trace it instantly
+    console.error("CRITICAL SQL ERROR IN SUBMIT_QUERY:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
 const addData = async (req, res) => {
   try {
     const { name, email, age } = req.body;
@@ -180,7 +188,7 @@ const addData = async (req, res) => {
       `INSERT INTO records (name, email, age, source_type) VALUES ($1, $2, $3, 'TEXT') RETURNING *`,
       [name, email, age]
     );
-    res.json({ success: true, message: "Database bridge online! Connection confirmed.", data: result.rows[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -195,21 +203,20 @@ const getData = async (req, res) => {
   }
 };
 
-const exportExcel = async (req, res) => {
+const replyQuery = async (req, res) => {
   try {
-    const targetTable = req.query.table || 'records';
-    if (!STRICT_TABLE_WHITELIST.includes(targetTable)) return res.sendStatus(400);
-    const result = await pool.query(`SELECT * FROM ${targetTable} ORDER BY id DESC`);
-    const filePath = exportToExcel(result.rows);
-    res.download(filePath);
+    const { queryId, reply_text } = req.body;
+    // Update resolution parameters and attach response text string
+    await pool.query(
+      "UPDATE queries SET reply_text = $1, is_resolved = TRUE WHERE id = $2",
+      [reply_text, queryId]
+    );
+    res.json({ success: true, message: "Reply dispatched. Notification cleared." });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 };
 
-const submitQuery = async (req, res) => {
-  res.json({ success: true, message: "Query Logged Successfully" });
-};
 
 module.exports = {
   addData,
@@ -219,4 +226,5 @@ module.exports = {
   uploadPDF,
   getWorkbookTableData,
   submitQuery,
+  replyQuery
 };
