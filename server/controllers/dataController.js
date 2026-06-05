@@ -1,90 +1,202 @@
 const pool = require("../config/db");
 const { exportToExcel } = require("../services/excelService");
-
+const { exec } = require("child_process");
+const path = require("path");
 // IMPORTING Standalone Modular Core Services
 const { extractTextFromPDF } = require("../services/pdfService");
 const { mapTextToColumnsStrategy } = require("../services/strategyMatcher");
 const { buildWorkbookSearchQuery } = require("../services/queryFilterService");
 
-// Whitelist validation boundaries
-const STRICT_TABLE_WHITELIST = [
-  'bore_type', 'density_unit', 'dp_unit', 'flange_material', 'flange_schedule',
-  'flange_type', 'flow_rate_unit', 'gasket', 'jackbolt', 'master_data',
-  'ofa_upload', 'pipe_material', 'plate_material', 'pressure_unit', 'records',
-  'rj_holder_material', 'size_nps_dn', 'studnut', 'tap_orientation', 'temp_unit', 'viscosity_unit'
-];
+// // Whitelist validation boundaries
+// const STRICT_TABLE_WHITELIST = [
+//   'bore_type', 'density_unit', 'dp_unit', 'flange_material', 'flange_schedule',
+//   'flange_type', 'flow_rate_unit', 'gasket', 'jackbolt', 'master_data',
+//   'ofa_upload', 'pipe_material', 'plate_material', 'pressure_unit', 'records',
+//   'rj_holder_material', 'size_nps_dn', 'studnut', 'tap_orientation', 'temp_unit', 'viscosity_unit'
+// ];
 
-// ==========================================================
-// 1. DYNAMIC GRID INQUIRY SYSTEM
-// ==========================================================
-const getWorkbookTableData = async (req, res) => {
+/**
+ * 🔒 ZERO HARD-BINDING SECURITY GUARD
+ * Polling PostgreSQL system catalogs directly to confirm table existence.
+ * Protects against raw malicious string inputs and SQL injections.
+ */
+const verifyTableExistsDynamically = async (tableName) => {
   try {
-    const { tableName } = req.params;
-    if (!STRICT_TABLE_WHITELIST.includes(tableName)) {
-      return res.status(400).json({ success: false, message: "Access Denied: Invalid table selection." });
-    }
+    if (!tableName) return false;
+    const cleanTableName = String(tableName).toLowerCase().trim();
 
-    const columnDiscovery = await pool.query(
-      `SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`,
-      [tableName]
+    // Directly interrogate the internal system table definitions schema catalog
+    const catalogCheck = await pool.query(
+      `SELECT table_name FROM information_schema.tables 
+       WHERE table_schema = 'public' AND LOWER(table_name) = $1`,
+      [cleanTableName]
     );
-    const columns = columnDiscovery.rows.map(c => c.column_name);
 
-    const { baseQueryString, sqlArguments } = buildWorkbookSearchQuery(tableName, req.query, columns);
-    const finalizedQuery = baseQueryString + ` ORDER BY id DESC LIMIT 50`;
-    const filteredRows = await pool.query(finalizedQuery, sqlArguments);
-
-    res.json({ success: true, tableName, columns, rows: filteredRows.rows });
+    return catalogCheck.rows.length > 0;
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error("[SECURITY EXCEPTION] Table catalog verification failed:", err.message);
+    return false;
   }
 };
 
-// ==========================================================
-// 2. INDUSTRIAL DOCUMENT EXTRACTION PIPELINE
-// ==========================================================
+// =====================================================================
+// 📊 1. DYNAMIC DATA LEDGER RECONSTRUCTION VIEWPORT
+// =====================================================================
+const getWorkbookTableData = async (req, res) => {
+  try {
+    let { tableName } = req.params;
+    if (tableName) tableName = tableName.toLowerCase().trim();
+
+    // 🔍 DYNAMIC GATEWAY: Instantly verify table sovereignty against live DB engine catalogs
+    const isTableValid = await verifyTableExistsDynamically(tableName);
+    if (!isTableValid) {
+      return res.status(400).json({ success: false, message: `Access Denied: The requested worksheet layout '${tableName}' does not exist.` });
+    }
+
+    // Capture column keys and sorting arrays dynamically
+    const columnDiscovery = await pool.query(
+      `SELECT column_name, data_type FROM information_schema.columns 
+       WHERE table_schema = 'public' AND LOWER(table_name) = $1 
+       ORDER BY ordinal_position`,
+      [tableName]
+    );
+
+    if (columnDiscovery.rows.length === 0) {
+      return res.json({ success: true, tableName, columns: [], rows: [] });
+    }
+
+    const columnsList = columnDiscovery.rows.map(c => c.column_name);
+
+    // Build parametric SQL lookups directly matching your custom folder filter properties
+    const { baseQueryString, sqlArguments } = buildWorkbookSearchQuery(tableName, req.query, columnsList);
+    
+    // ✅ NO HARD-CODING: Dynamically order rows on whatever variable occupies index zero (your precise A1 cell location)
+    const dynamicSortingAnchor = `"${columnsList[0]}"`;
+    const finalizedQuery = baseQueryString + ` ORDER BY ${dynamicSortingAnchor} ASC LIMIT 50`;
+    
+    const filteredRows = await pool.query(finalizedQuery, sqlArguments);
+
+    return res.json({ 
+      success: true, 
+      tableName, 
+      columns: columnsList, 
+      rows: filteredRows.rows 
+    });
+
+  } catch (err) {
+    console.error("DYNAMIC INQUIRY ENGINE FAULT:", err.message);
+    return res.status(500).json({ success: false, error: "Database inquiry pipeline failure: " + err.message });
+  }
+};
+
+// =====================================================================
+// 📤 2. DYNAMIC FIELD DATA EXTRACTION & EXTRACTION INGESTION ENGINE
+// =====================================================================
 const uploadPDF = async (req, res) => {
   try {
-    const file = req.file;
-    const targetTable = req.body.target_table || 'ofa_upload';
+    const fileAsset = req.file;
+    const targetSpreadsheet = req.body.target_table ? req.body.target_table.toLowerCase().trim() : 'ofa_upload';
 
-    if (!STRICT_TABLE_WHITELIST.includes(targetTable) || targetTable === 'records') {
-      return res.status(400).json({ success: false, error: "Invalid target spreadsheet selection." });
+    // 🔍 DYNAMIC GATEWAY: Block unauthorized storage inputs on the fly
+    const isTableValid = await verifyTableExistsDynamically(targetSpreadsheet);
+    if (!isTableValid || targetSpreadsheet === 'queries') {
+      return res.status(400).json({ success: false, error: `Invalid Target: Workspace sheet table '${targetSpreadsheet}' is unavailable.` });
     }
-    if (!file) return res.status(400).json({ success: false, message: "No document attached." });
+    if (!fileAsset) return res.status(400).json({ success: false, message: "No document attached to request." });
 
-    // A. Parse document raw text
-    const extractedText = await extractTextFromPDF(file.path);
-
-    // B. Query database metadata details directly
-    const columnDiscovery = await pool.query(
-      `SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position`,
-      [targetTable]
+    // Instantly discover target column parameters straight from the dynamic catalogs
+    const schemaCatalogDiscovery = await pool.query(
+      `SELECT column_name, data_type FROM information_schema.columns 
+       WHERE table_schema = 'public' AND LOWER(table_name) = $1 
+       ORDER BY ordinal_position`,
+      [targetSpreadsheet]
     );
 
-    // C. Evaluate matching profiles using our newly verified strategy matcher
-    const queryValues = mapTextToColumnsStrategy(columnDiscovery.rows, extractedText, file);
-    const tableColumns = columnDiscovery.rows.map(r => r.column_name);
-
-    // D. Isolate structural sequences for custom database parameters mapping
-    const insertFields = tableColumns.filter(col => col !== 'id' && col !== 'created_at');
+    const pythonScriptWorkerPath = path.join(__dirname, "../workers/extractor.py");
     
-    // ✅ ESCAPING WRAPPER: Ensures spacing inputs like "Item Name" never confuse the parser!
-    const fieldsStr = insertFields.map(col => `"${col}"`).join(", ");
-    const valuesStr = insertFields.map((_, index) => `$${index + 1}`).join(", ");
+    // Execute background worker processes cleanly
+    exec(`python3 "${pythonScriptWorkerPath}" "${fileAsset.path}"`, async (err, stdout, stderr) => {
+      if (err) {
+        console.error("Python processing exception thrown:", stderr || err.message);
+        return res.status(500).json({ success: false, error: "Document text canvas extraction processing aborted." });
+      }
 
-    const dbInsertResult = await pool.query(
-      `INSERT INTO ${targetTable} (${fieldsStr}) VALUES (${valuesStr}) RETURNING *`,
-      queryValues
-    );
+      try {
+        const scriptResult = JSON.parse(stdout);
+        if (!scriptResult.success) {
+          return res.status(500).json({ success: false, error: "Parser core layout extraction drop: " + scriptResult.error });
+        }
 
-    res.json({
-      success: true,
-      message: `Document processed and logged inside table: ${targetTable}`,
-      insertedData: dbInsertResult.rows[0]
+        const documentTextLines = (scriptResult.payload || '').split('\n');
+        
+        const columnFieldsKeysList = [];
+        const cleanDatabaseValuesArray = [];
+
+        // ✅ PURE FLUID REFLECTION: Iterate entirely on current column models returned dynamically
+        schemaCatalogDiscovery.rows.forEach(col => {
+          const fieldName = col.column_name;
+          const dbDataType = String(col.data_type).toLowerCase();
+
+          columnFieldsKeysList.push(fieldName);
+          
+          let resolvedValueToken = null;
+          const normalizedTargetKey = fieldName.toLowerCase().replace(/_/g, ' ').trim();
+
+          // Search structural match combinations across layout text vectors
+          for (let line of documentTextLines) {
+            let cleanLine = line.toLowerCase().trim();
+            if (cleanLine.includes(normalizedTargetKey)) {
+              let valuesSegmentStr = line.replace(new RegExp(normalizedTargetKey, 'i'), '');
+              let cleanToken = valuesSegmentStr.replace(/^[:\-|\s]+|[:\-|\s]+$/g, '').trim();
+              
+              if (cleanToken.includes('   ')) {
+                cleanToken = cleanToken.split('   ')[0].trim();
+              }
+
+              if (cleanToken.length > 0) {
+                resolvedValueToken = cleanToken;
+                break;
+              }
+            }
+          }
+
+          // Enforce data type boundaries before committing to PostgreSQL columns
+          if (dbDataType.includes('int') || dbDataType.includes('num') || dbDataType.includes('double') || dbDataType.includes('float')) {
+            if (resolvedValueToken) {
+              let numericCleanText = String(resolvedValueToken).replace(/[^0-9.]/g, '');
+              let castFloat = parseFloat(numericCleanText);
+              cleanDatabaseValuesArray.push(isNaN(castFloat) ? 0 : castFloat);
+            } else {
+              cleanDatabaseValuesArray.push(0);
+            }
+          } else {
+            cleanDatabaseValuesArray.push(resolvedValueToken ? String(resolvedValueToken).substring(0, 255).trim() : null);
+          }
+        });
+
+        // Map column parameters dynamically
+        const fieldsClauseStr = columnFieldsKeysList.map(f => `"${f}"`).join(", ");
+        const variablesClauseStr = columnFieldsKeysList.map((_, idx) => `$${idx + 1}`).join(", ");
+
+        const parametricInsertSQLQuery = `INSERT INTO ${targetSpreadsheet} (${fieldsClauseStr}) VALUES (${variablesClauseStr}) RETURNING *`;
+        const dbWriteResult = await pool.query(parametricInsertSQLQuery, cleanDatabaseValuesArray);
+        
+        console.log(`[DYNAMIC INGESTION SUCCESS] Perfectly saved data row inside table: ${targetSpreadsheet}`);
+
+        return res.json({
+          success: true,
+          message: `Document processed fluidly and saved securely within active schema rows: ${targetSpreadsheet}`,
+          insertedData: dbWriteResult.rows[0]
+        });
+
+      } catch (innerMappingError) {
+        console.error("Dynamic database insertion fault caught:", innerMappingError.message);
+        return res.status(500).json({ success: false, error: "Database mapping transaction entry aborted: " + innerMappingError.message });
+      }
     });
+
   } catch (err) {
-    res.status(500).json({ success: false, error: "Modular Pipeline Intercept Error: " + err.message });
+    return res.status(500).json({ success: false, error: "Pipeline processing intercept gate break: " + err.message });
   }
 };
 
